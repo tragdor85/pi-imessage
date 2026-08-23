@@ -215,9 +215,25 @@ export function handleValue(d: SqlDb, rowid: number | null | undefined): string 
   return r ? String(r.id) : null;
 }
 
-/** message.date is seconds since the Apple iOS epoch (2001-01-01). */
-export function appleDateToIso(date: number | null): string | null {
-  if (date === null) return null;
-  const t = new Date((date + 978307200) * 1000);
-  return t.toISOString();
+/** 2001-01-01T00:00:00Z in unix seconds (Apple's legacy timestamp epoch). */
+const APPLE_EPOCH = 978307200;
+
+/**
+ * message.date has used more than one encoding across macOS versions:
+ * older systems store whole seconds since 2001-01-01; modern ones store
+ * integer nanoseconds (observed in the wild: 809187336256532000 =
+ * 2026-08-23T14:15:36Z). Auto-detect the scale by magnitude, and return
+ * null for anything unrepresentable so callers fall back gracefully.
+ */
+export function appleDateToIso(raw: number | null | undefined): string | null {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
+  const v = Math.abs(raw);
+  let sec: number;
+  if (v < 1e10) sec = raw; // whole seconds (2001 → ~2286 CE)
+  else if (v < 1e13) sec = raw / 1e3; // milliseconds
+  else if (v < 1e16) sec = raw / 1e6; // microseconds
+  else if (v < 1e19) sec = raw / 1e9; // nanoseconds (modern macOS)
+  else return null; // out of any known range — garbage
+  const t = new Date((sec + APPLE_EPOCH) * 1000);
+  return Number.isNaN(t.getTime()) ? null : t.toISOString();
 }

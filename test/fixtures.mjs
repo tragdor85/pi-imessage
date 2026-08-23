@@ -10,7 +10,9 @@ export const SELF_EMAIL = "test@example.com";
 export const PEER_PHONE = "+15551234567";
 export const OTHER_PHONE = "+15559876543";
 
-export const APPLE_T = 787_000_000;
+// Modern macOS stores message.date as integer nanoseconds since 2001-01-01
+// (older systems used whole seconds; appleDateToIso auto-detects the scale).
+export const APPLE_T = 787_000_000 * 1e9; // ≈ 2025-12-09
 
 export function buildFixture(dbPath) {
   rmSync(dbPath, { force: true });

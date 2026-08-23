@@ -17,7 +17,13 @@ polling disabled by default (command to enable); allowlist-gated inbound AND out
 - [ ] User runs TUI: /imessage poll on, allow a peer, live message flow (manual)
 
 ## Current Phase
-DONE — implementation + verification complete. Only manual TUI live-test remains.
+FIXED "Invalid time value" crash (2026-08-23) — root cause was date ENCODING, not a
+bad value: modern macOS stores message.date as integer NANOS since 2001-01-01
+(≈8e17), old code assumed whole seconds → out-of-range Date → RangeError at
+toISOString(). appleDateToIso now auto-detects scale by magnitude (sec<1e10,
+ms<1e13, us<1e16, ns<1e19) + finite/NaN guards → null fallback for callers.
+Re-verified: sweep of ALL 101,513 distinct real DB dates renders (2018-03-31 →
+today), full suite green, real pi 0.84.2 E2E clean.
 
 ## Completed
 - src/config.ts — load/save ~/.pi/agent/pi-imessage/config.json (PI_IMESSAGE_CONFIG),
@@ -42,7 +48,7 @@ DONE — implementation + verification complete. Only manual TUI live-test remai
 
 ## Relevant Files
 - src/index.ts (boot/poll/handleRow/status/command/tool), src/db.ts, src/config.ts, src/send.ts
-- test/{fixtures,db.test,real.test,factory.test}.mjs
+- test/{fixtures,db.test,real.test,factory.test}.mjs, test/real-sweep.mjs (regression diagnostic)
 - package.json (pi manifest → src/index.ts), linked ~/.pi/agent/extensions/pi-imessage
 
 ## Decisions
@@ -54,18 +60,24 @@ DONE — implementation + verification complete. Only manual TUI live-test remai
 - better-sqlite3 ESM: default import is the constructor (named import fails)
 
 ## Tests
-node test/db.test.mjs ✔ ; node test/real.test.mjs ✔ ; node test/factory.test.mjs ✔
+node test/db.test.mjs ✔ (incl. appleDateToIso scale unit tests sec/ms/us/ns + garbage→null)
+node test/real.test.mjs ✔ ; node test/factory.test.mjs ✔ (fixture now ns-scale dates)
+node test/real-sweep.mjs ✔ (all 101,513 distinct real dates render; exit 1 on throw)
 npx tsc --noEmit ✔
 
 ## Failures
-- (none open; previous failures all fixed: fixture handle.id shape, learnSelf
-  account formats, group detection, last-peer, mock registerTool shape,
-  send-gate vs allowlist in tests, note prefix, empty-allowlist text, invalid regex)
+- "Invalid time value" RangeError (user report): message.date on modern macOS is ns
+  since 2001 (~8e17), not seconds. Fix: magnitude-based scale auto-detection in
+  appleDateToIso (src/db.ts) + Number.isFinite/NaN guards; fixture switched to ns
+  scale for e2e coverage. Verified by real-sweep over the entire real DB.
+- (older, fixed: fixture handle.id shape, learnSelf account formats, group detection,
+  last-peer, mock registerTool shape, send-gate vs allowlist in tests, note prefix,
+  empty-allowlist text)
 
 ## Blockers
 - (none)
 
 ## Next Action
-Manual TUI: open pi, /imessage poll on + /imessage allow +PEER, send a real iMessage
-from another device, confirm delivery + /imessage status; then /imessage send test.
-Optional: E2E agent-driven send via hook (pi -p "send me a test iMessage").
+Commit the date-scale fix; then manual TUI: open pi, /imessage poll on +
+/imessage allow +PEER, send a real iMessage from another device, confirm delivery
++ /imessage status; then /imessage send test.

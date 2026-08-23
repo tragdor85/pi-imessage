@@ -52,10 +52,19 @@ const cfgmod = jiti("../src/config.ts");
   assert.equal(learned.phone, SELF_PHONE);
   assert.equal(learned.email, SELF_EMAIL);
 
-  // appleDateToIso: 750000000 apple-epoch seconds → 2024
-  const iso = dbmod.appleDateToIso(750_000_000);
-  assert.match(iso, /^20\d\d-/);
+  // appleDateToIso: scale auto-detection (legacy seconds, modern ns, garbage)
+  assert.equal(dbmod.appleDateToIso(380), "2001-01-01T00:06:20.000Z", "seconds since 2001");
+  assert.equal(dbmod.appleDateToIso(750_000_000).slice(0, 4), "2024", "seconds bucket");
+  // one instant, three encodings (real-DB value observed 2026-08-23T14:15:36Z)
+  assert.match(dbmod.appleDateToIso(809_187_336_256), /^2026-08-23T14:15:3[56]/, "ms encoding");
+  assert.match(dbmod.appleDateToIso(809_187_336_256_000), /^2026-08-23T14:15:3[56]/, "us encoding");
+  assert.match(dbmod.appleDateToIso(809_187_336_256_532_000), /^2026-08-23T14:15:3[56]/, "ns encoding");
+  // garbage / unrepresentable → null (callers fall back to new Date())
   assert.equal(dbmod.appleDateToIso(null), null);
+  assert.equal(dbmod.appleDateToIso(undefined), null);
+  assert.equal(dbmod.appleDateToIso(NaN), null);
+  assert.equal(dbmod.appleDateToIso(Infinity), null);
+  assert.equal(dbmod.appleDateToIso(-1e20), null);
 
   dbmod.close();
   assert.equal(dbmod.open() === dbmod.open(), true, "reopen after close ok");
