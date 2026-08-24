@@ -176,6 +176,54 @@ assert.match(status, /polling:\s+on \(every 25 ms\)/, "status shows polling on")
   assert.ok(log.includes(PEER_PHONE), "last peer used as default target");
 }
 
+/* --- self-echo suppression + user self-chat still delivered ---------- */
+{
+  const dbw = new Database(DB);
+  const insM = dbw.prepare(
+    `INSERT INTO message (guid, service, account, text, date, is_from_me, item_type, is_empty,
+                          is_service_message, is_system_message, replace, handle_id)
+     VALUES (?, 'iMessage', ?, ?, ?, ?, 0, 0, 0, 0, 0, ?)`,
+  );
+  const insCmj = dbw.prepare(
+    "INSERT INTO chat_message_join (chat_id, message_id, message_date, index_state, filter_action, filter_sub_action) VALUES (?, ?, ?, 0, 0, 0)",
+  );
+  const chatSelf = 2, hSelf = 1; // fixture: 1-handle self chat (handle 1 = SELF)
+  const selfRow = (text, fromMe) => {
+    const m = insM.run("e-" + Math.random(), "iMessage:P:" + SELF_PHONE, text, APPLE_T, fromMe, hSelf).lastInsertRowid;
+    return insCmj.run(chatSelf, m, APPLE_T).lastInsertRowid;
+  };
+
+  const sentBefore = sent.length;
+  // Agent sends into its own self-chat (own identities are always allowed).
+  await api.commands.imessage.handler(`send ${SELF_PHONE} ping from agent`, ctx);
+  // The server echo arrives as an inbound-shaped row (is_from_me=0, sender = self).
+  const rEcho = selfRow("ping from agent", 0);
+  // The user's own self-chat message (e.g. typed on the phone) must still deliver.
+  const rUser = selfRow("user reply from phone", 0);
+  // User re-types the agent's exact text AFTER the echo was consumed — one-shot
+  // consumption means it now delivers.
+  const rUser2 = selfRow("ping from agent", 0);
+
+  await sleep(150); // ~6 poll ticks
+  dbw.close();
+
+  assert.equal(sent.length, sentBefore + 2, "echo suppressed; both genuine self-chat rows delivered");
+  assert.match(sent[sentBefore].msg, /^\[iMessage self-chat @ [^\]]+\] user reply from phone$/, "user row delivered first");
+  assert.match(sent[sentBefore + 1].msg, /^\[iMessage self-chat @ [^\]]+\] ping from agent$/, "re-typed text delivered after one-shot consumption");
+  assert.ok(notesFlat().find((n) => n.includes("suppressed self-echo")), "suppression noted");
+
+  // Reply routing: the next send targets the number that last messaged (the
+  // self-chat's own handle), not the previous peer.
+  const logBefore = (() => { try { return readFileSync(SEND_LOG, "utf8"); } catch { return ""; } })();
+  await api.tools.imessage_send.execute("call-echo-route", { text: "reply routing check" }, undefined, undefined, ctx);
+  const logNew = readFileSync(SEND_LOG, "utf8").slice(logBefore.length);
+  assert.ok(logNew.startsWith(SELF_PHONE), "reply routed to the number that sent (self-chat)");
+
+  status = await statusBlock();
+  const wm = Number(/watermark:\s+(\d+)/.exec(status)[1]);
+  assert.ok(wm >= Math.max(rEcho, rUser, rUser2), "watermark advanced past echo + user rows");
+}
+
 /* --- session shutdown ---------------------------------------------- */
 {
   await api.handlers.session_shutdown?.(undefined, ctx);

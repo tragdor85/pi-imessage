@@ -5,7 +5,10 @@
  *    `/imessage poll on`) for messages newer than a watermark that is seeded
  *    at the newest row at startup, so no old messages are ever re-delivered.
  *  - New inbound 1:1 iMessage DMs from the allowlist (and self-chat) are
- *    injected as user messages for the agent.
+ *    injected as user messages for the agent. Own sent messages are filtered
+ *    (is_from_me=1) and their server-side self-chat echoes (is_from_me=0,
+ *    sender = own handle, fresh GUID) are swallowed via text+peer one-shot
+ *    fingerprints, so replies from phone/devices still come through.
  *  - Outbound goes through the `imessage_send` tool (osascript → Messages.app);
  *    recipients are restricted to the allowlist, own identities always allowed.
  *  - Group chats, SMS, attachments, and history search are intentionally
@@ -56,7 +59,21 @@ interface Bridge {
   lastEvent: { time: string; peer: string; text: string } | null;
   lastDenied: { time: string; peer: string; text: string } | null;
   lastError: string | null;
+  /** Fingerprints of messages this session sent, for self-echo suppression. */
+  outboundEchoes: EchoEntry[];
 }
+
+/**
+ * A fingerprint of a message this session sent via Messages.app, used to
+ * swallow the server-side echo of a self-chat send (see isSelfEcho).
+ */
+interface EchoEntry {
+  text: string;
+  peer: string;
+  atMs: number;
+}
+const ECHO_TTL_MS = 2 * 60 * 1000; // echoes arrive within seconds; 2 min is generous
+const ECHO_MAX = 50; // bound memory even on chatty sessions
 
 let b: Bridge;
 
@@ -222,6 +239,36 @@ function rememberPeer(peer: string): void {
   b.lastPeer = peer;
 }
 
+/**
+ * Record an outbound send so its server echo can be suppressed.
+ * A self-chat iMessage sent from this Mac comes BACK as an inbound row
+ * (is_from_me=0, sender = own handle, fresh GUID) that is indistinguishable
+ * from a user self-chat message typed on the phone; only "we just sent this
+ * exact text to this chat" separates the two.
+ */
+function recordOutboundEcho(peer: string, text: string): void {
+  const now = Date.now();
+  b.outboundEchoes = b.outboundEchoes.filter((e) => now - e.atMs < ECHO_TTL_MS);
+  b.outboundEchoes.push({ text: text.trim(), peer, atMs: now });
+  if (b.outboundEchoes.length > ECHO_MAX)
+    b.outboundEchoes.splice(0, b.outboundEchoes.length - ECHO_MAX);
+}
+
+/**
+ * Matches (and CONSUMES) the entry when an inbound row is the echo of a
+ * message this session just sent. One-shot: each send suppresses at most one
+ * row, so if the user then types the same text again it still delivers.
+ */
+function isSelfEcho(peer: string, text: string): boolean {
+  const now = Date.now();
+  const i = b.outboundEchoes.findIndex(
+    (e) => now - e.atMs < ECHO_TTL_MS && e.text === text && sameHandle(e.peer, peer),
+  );
+  if (i < 0) return false;
+  b.outboundEchoes.splice(i, 1);
+  return true;
+}
+
 function handleRow(r: InboundRow): void {
   const db = b.db;
   if (!db) return;
@@ -255,6 +302,15 @@ function handleRow(r: InboundRow): void {
     const t = appleDateToIso(r.date) ?? new Date().toISOString();
     b.lastDenied = { time: t, peer, text: truncate(text, 80) };
     note(`denied inbound from ${peer} (not allowlisted)`, "warning");
+    persist();
+    return;
+  }
+
+  // Self-echo suppression: a send from this session arriving back as an
+  // inbound-shaped row (is_from_me=0, sender = own handle). Consumed
+  // one-shot, so an identical genuine user message later still delivers.
+  if (isSelfEcho(peer, text)) {
+    note(`suppressed self-echo → ${truncate(text, 80)}`, "info");
     persist();
     return;
   }
@@ -298,8 +354,10 @@ function doSend(
   }
   const res = sendImessage(text, to);
   res.then((r) => {
-    if (r.ok) b.lastPeer = to;
-    else {
+    if (r.ok) {
+      b.lastPeer = to;
+      recordOutboundEcho(to, text);
+    } else {
       b.lastError = `send to ${to} failed: ${r.error}`;
       note(b.lastError!, "error");
       persist();
@@ -507,6 +565,7 @@ export default function (pi: ExtensionAPI): void {
     lastEvent: null,
     lastDenied: null,
     lastError: null,
+    outboundEchoes: [],
   };
 
   pi.on("session_start", (_event, ctx) => {
