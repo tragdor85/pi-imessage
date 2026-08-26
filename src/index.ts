@@ -11,6 +11,11 @@
  *    fingerprints, so replies from phone/devices still come through.
  *  - Outbound goes through the `imessage_send` tool (osascript → Messages.app);
  *    recipients are restricted to the allowlist, own identities always allowed.
+ *  - Global-todo skill: `@task <text>` inbounds (self or allowlisted) are
+ *    routed to the shared todo store — never to the LLM. Notifications queued
+ *    by the hourly loop in the outbox directory are drained and sent here;
+ *    the loop itself never sends, because a send from another process would
+ *    look like an inbound self-echo row and could re-enter the agent.
  *  - Group chats, SMS, attachments, and history search are intentionally
  *    unsupported in v1.
  *
@@ -41,6 +46,14 @@ import {
   InboundRow,
 } from "./db.ts";
 import { canSend, sendImessage, SendResult } from "./send.ts";
+import {
+  runTaskctl,
+  outboxEntries,
+  outboxDone,
+  outboxBump,
+  taskctlAvailable,
+  TASKCTL,
+} from "./tasks.ts";
 
 /* ------------------------------------------------------------------ */
 /* state                                                               */
@@ -54,6 +67,8 @@ interface Bridge {
   polling: boolean;
   timer: NodeJS.Timeout | null;
   busy: boolean;
+  /** Re-entrancy guard for the global-todo outbox drain. */
+  drainBusy: boolean;
   ctx: ExtensionContext | null;
   lastPeer: string | null;
   lastEvent: { time: string; peer: string; text: string } | null;
@@ -216,6 +231,7 @@ function tick(): void {
   if (b.busy || !b.polling) return;
   if (!b.db) return;
   b.busy = true;
+  void drainOutbox(); // global-todo notifications; independent of row polling
   try {
     const rows = pollNew(b.db, b.watermark);
     if (rows.length === 0) return;
@@ -315,6 +331,15 @@ function handleRow(r: InboundRow): void {
     return;
   }
 
+  // @task dispatch (global-todo skill): the text goes to the shared todo
+  // store, never to the LLM — no turn is consumed. Fire-and-forget: taskctl
+  // may wait on the store lock held by the hourly loop (≤30 s), which must
+  // not stall the 1 s poll tick.
+  if (text === "@task" || text.startsWith("@task ")) {
+    void handleTask(peer, text);
+    return;
+  }
+
   const time = appleDateToIso(r.date) ?? new Date().toISOString();
   const label = self ? "iMessage self-chat" : `iMessage from ${peer}`;
   const msg = `[${label} @ ${time}] ${text}`;
@@ -364,6 +389,96 @@ function doSend(
     }
   });
   return res.then((r) => (r.ok ? { ...r, to } : r));
+}
+
+/* ------------------------------------------------------------------ */
+/* global-todo skill: @task dispatch + outbox drain                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Drain the global-todo outbox: iMessage notifications queued by the hourly
+ * loop and worker. The loop cannot send on its own — a send from a separate
+ * process would arrive as an inbound self-echo row that could re-inject into
+ * an agent; the bridge owns echo suppression, so the bridge does the sending.
+ * Reuses doSend, so allowlist rules and outbound-echo recording apply.
+ */
+async function drainOutbox(): Promise<void> {
+  if (b.drainBusy || !b.polling) return;
+  b.drainBusy = true;
+  try {
+    for (const e of outboxEntries()) {
+      const to = e.to === "self" ? (b.cfg.meHandles[0] ?? "") : e.to;
+      if (!to || !(isSelf(to) || isAllowed(to))) {
+        outboxDone(e.file); // unresolvable or not allowlisted: drop
+        continue;
+      }
+      const r = await doSend(to, e.text);
+      if (r.ok) outboxDone(e.file);
+      else {
+        outboxBump(e.file); // attempt recorded; retried on the next drain
+        break; // stop at the first failure to preserve FIFO order
+      }
+    }
+  } catch {
+    /* fs/transient error: retry on the next tick */
+  } finally {
+    b.drainBusy = false;
+  }
+}
+
+/**
+ * Handle a `@task` inbound deterministically (no LLM turn consumed):
+ *   @task           → list the queue
+ *   @task list      → list the queue
+ *   @task <text>    → add to the global store; the hourly loop picks it up
+ */
+async function handleTask(peer: string, text: string): Promise<void> {
+  const body = text.replace(/^@task\b/, "").trim();
+  const cmd = body.toLowerCase();
+  const reply = (msg: string) => {
+    void doSend(peer, msg).then((r) => {
+      if (!r.ok) note(`@task reply failed: ${r.error}`, "error");
+    });
+  };
+  if (!taskctlAvailable()) {
+    reply(`todo system not installed (expected ${TASKCTL})`);
+    return;
+  }
+  try {
+    if (!body || cmd === "help" || cmd === "list" || cmd === "ls" || cmd === "status") {
+      const res = await runTaskctl(["list"]);
+      const tasks: any[] = res.tasks ?? [];
+      const open = tasks.filter(
+        (t) => t.status === "pending" || t.status === "in-progress",
+      );
+      const done = tasks.filter((t) => t.status === "done");
+      if (open.length === 0 && done.length === 0) {
+        reply("✅ No todos.");
+        return;
+      }
+      const lines = open.map((t) => `${t.status === "in-progress" ? "⚡" : "•"} ${t.id}  ${t.title}`);
+      reply(`✅ Todos — ${open.length} open, ${done.length} done:\n${lines.join("\n")}`);
+      return;
+    }
+    const res = await runTaskctl([
+      "add",
+      body,
+      "--source",
+      "imessage",
+      "--source-peer",
+      isSelf(peer) ? "self" : peer,
+    ]);
+    if (!res.ok) {
+      reply(`todo error: ${res.error ?? "unknown"}`);
+      return;
+    }
+    reply(
+      `✅ Todo ${res.task.id} queued: ${res.task.title} (${res.pendingCount} open). ` +
+        `It runs on the hourly loop when the model is free; you'll get a text when it finishes.`,
+    );
+  } catch (e) {
+    reply(`todo error: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -560,6 +675,7 @@ export default function (pi: ExtensionAPI): void {
     polling: false,
     timer: null,
     busy: false,
+    drainBusy: false,
     ctx: null,
     lastPeer: null,
     lastEvent: null,
@@ -581,4 +697,17 @@ export default function (pi: ExtensionAPI): void {
 export { loadConfig, saveConfig, defaultConfig, normHandle, sameHandle, normSet, CONFIG_FILE, type ImeConfig } from "./config";
 export { open, close, isMacOS, chatDbPath, isAvailable, maxRowid, learnSelf, pollNew, chatHandles, isGroupChat, peerOf, appleDateToIso, type SqlDb, type InboundRow } from "./db";
 export { canSend, sendImessage, type SendResult } from "./send";
+export {
+  runTaskctl,
+  outboxEntries,
+  outboxDone,
+  outboxBump,
+  taskctlAvailable,
+  TODO_HOME,
+  TASKCTL,
+  OUTBOX_DIR,
+  OUTBOX_DEAD,
+  OUTBOX_MAX_TRIES,
+  type OutboxEntry,
+} from "./tasks";
 export { dbAvailable };

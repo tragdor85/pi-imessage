@@ -2,7 +2,7 @@
 // Mocks the pi ExtensionAPI; verifies boot, polling, inbound delivery,
 // echo suppression, denial, access control, config round-trips and sending.
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync, mkdirSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createJiti } from "jiti";
@@ -35,6 +35,7 @@ chmodSync(FAKE_SEND, 0o755);
 process.env.PI_IMESSAGE_DB = DB;
 process.env.PI_IMESSAGE_CONFIG = CFG;
 process.env.PI_IMESSAGE_SEND_CMD = FAKE_SEND;
+process.env.PI_TODO_HOME = path.join(tmp, "todos"); // scratch global-todo store
 
 const mod = createJiti(import.meta.url, { fsCache: false, moduleCache: false })("../src/index.ts");
 
@@ -222,6 +223,50 @@ assert.match(status, /polling:\s+on \(every 25 ms\)/, "status shows polling on")
   status = await statusBlock();
   const wm = Number(/watermark:\s+(\d+)/.exec(status)[1]);
   assert.ok(wm >= Math.max(rEcho, rUser, rUser2), "watermark advanced past echo + user rows");
+}
+
+/* --- @task dispatch (global-todo skill) + outbox drain -------------- */
+{
+  const todosHome = path.join(tmp, "todos");
+  const dbw = new Database(DB);
+  const insM = dbw.prepare(
+    `INSERT INTO message (guid, service, account, text, date, is_from_me, item_type, is_empty,
+                          is_service_message, is_system_message, replace, handle_id)
+     VALUES (?, 'iMessage', ?, ?, ?, ?, 0, 0, 0, 0, 0, ?)`,
+  );
+  const insCmj = dbw.prepare(
+    "INSERT INTO chat_message_join (chat_id, message_id, message_date, index_state, filter_action, filter_sub_action) VALUES (?, ?, ?, 0, 0, 0)",
+  );
+  const chatSelf = 2, hSelf = 1; // fixture self chat (handle 1 = SELF)
+  const selfRow = (text) => {
+    const m = insM.run("q-" + Math.random(), "iMessage:P:" + SELF_PHONE, text, APPLE_T, 0, hSelf).lastInsertRowid;
+    insCmj.run(chatSelf, m, APPLE_T);
+  };
+
+  const sentBefore = sent.length;
+  selfRow("@task write a haiku about databases");
+  await sleep(300); // poll tick → async taskctl add → confirmation send
+  dbw.close();
+
+  assert.equal(sent.length, sentBefore, "@task text never injected into the agent");
+  const store = JSON.parse(readFileSync(path.join(todosHome, "tasks.json"), "utf8"));
+  assert.ok(store.tasks.some((t) => t.title.includes("haiku")), "task recorded in the global store");
+  assert.equal(store.tasks[0].source, "imessage", "source attributed");
+  const log = readFileSync(SEND_LOG, "utf8");
+  assert.ok(log.includes(SELF_PHONE) && log.includes("haiku"), "queued confirmation sent to self");
+  assert.ok(!notesFlat().find((n) => n.includes("delivered") && n.includes("@task")), "no delivery note for @task row");
+
+  // Hourly-loop side: a worker queues a completion notification; the bridge drains it.
+  const obDir = path.join(todosHome, "outbox");
+  mkdirSync(obDir, { recursive: true });
+  writeFileSync(
+    path.join(obDir, "20260826-120000-000-abcd.json"),
+    JSON.stringify({ to: "self", text: "✅ Todo T0001 done — summary in /tmp/haiku.md", at: new Date().toISOString(), tries: 0 }),
+  );
+  await sleep(300); // drain tick
+  const log2 = readFileSync(SEND_LOG, "utf8");
+  assert.ok(log2.includes("done — summary in /tmp/haiku.md"), "outbox notification delivered");
+  assert.equal(readdirSync(obDir).filter((n) => n.endsWith(".json")).length, 0, "outbox entry consumed");
 }
 
 /* --- session shutdown ---------------------------------------------- */
