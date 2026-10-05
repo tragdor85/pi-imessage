@@ -22,11 +22,17 @@
  * Commands:  /imessage [status | poll on|off | allow <h> | unallow <h> | me [h …] | send <to> <text>]
  * Env:       PI_IMESSAGE_CONFIG  config file path
  *            PI_IMESSAGE_DB      chat.db path (testing)
+ * Log:       denied (not-allowlisted) inbounds → denied.log (JSONL, beside the
+ *            config file); never printed to the console. `/imessage status`
+ *            shows the last denial.
  */
+import fs from "node:fs";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   CONFIG_FILE,
+  DENIED_LOG_FILE,
   ImeConfig,
   loadConfig,
   sameHandle,
@@ -129,6 +135,19 @@ function note(text: string, type: "info" | "warning" | "error" = "info"): void {
 
 function bindCtx(ctx: ExtensionContext): void {
   b.ctx = ctx;
+}
+
+/**
+ * Append a denial record to the JSONL log (beside the config file).
+ * Silent by design: denials are logged, never printed to the console.
+ */
+function logDenied(entry: { time: string; peer: string; text: string }): void {
+  try {
+    fs.mkdirSync(path.dirname(DENIED_LOG_FILE), { recursive: true });
+    fs.appendFileSync(DENIED_LOG_FILE, JSON.stringify(entry) + "\n", "utf8");
+  } catch {
+    /* never let logging crash the bridge */
+  }
 }
 
 function truncate(s: string, n: number): string {
@@ -317,7 +336,7 @@ function handleRow(r: InboundRow): void {
   if (!self && !isAllowed(peer)) {
     const t = appleDateToIso(r.date) ?? new Date().toISOString();
     b.lastDenied = { time: t, peer, text: truncate(text, 80) };
-    note(`denied inbound from ${peer} (not allowlisted)`, "warning");
+    logDenied(b.lastDenied);
     persist();
     return;
   }
@@ -499,6 +518,7 @@ function statusText(): string {
   );
   lines.push(`  sending:   ${canSend() ? "available (osascript)" : "unavailable"}`);
   lines.push(`  config:    ${CONFIG_FILE}`);
+  lines.push(`  denied log: ${DENIED_LOG_FILE}`);
   if (b.lastEvent)
     lines.push(`  last event: ${b.lastEvent.time} ${b.lastEvent.peer}: ${b.lastEvent.text}`);
   if (b.lastDenied)

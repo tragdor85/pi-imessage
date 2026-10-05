@@ -124,9 +124,12 @@ assert.match(status, /polling:\s+on \(every 25 ms\)/, "status shows polling on")
 
   assert.equal(sent.length, 1, "exactly one inbound delivered (deny/echo/group suppressed)");
   assert.match(sent[0].msg, /^\[iMessage from \+15551234567 @ [^\]]+\] hello again$/, "inbound framing");
-  assert.ok(notesFlat().find((n) => typeof n === "string" && n.includes("denied inbound from") && n.includes("+15559876543")), "denial noted");
+  assert.ok(!notesFlat().find((n) => n.includes("denied inbound from")), "denial not printed to console");
+  const denied = readFileSync(path.join(tmp, "denied.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.ok(denied.some((l) => l.peer === OTHER_PHONE && l.text.includes("intruder")), "denial logged to denied.log");
 
   status = await statusBlock();
+  assert.match(status, /last denied: .* \+15559876543/, "status still shows last denial");
   const wm = Number(/watermark:\s+(\d+)/.exec(status)[1]);
   assert.ok(wm >= Math.max(rDeny, rOwn, rIn, rGrp), "watermark advanced past all rows");
 }

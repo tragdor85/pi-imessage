@@ -15,6 +15,9 @@ export interface ImeConfig {
 export const CONFIG_DIR = path.join(os.homedir(), ".pi", "agent", "pi-imessage");
 export const CONFIG_FILE: string = process.env.PI_IMESSAGE_CONFIG || path.join(CONFIG_DIR, "config.json");
 
+/** JSONL log of denied (not-allowlisted) inbound messages — not printed to the console. */
+export const DENIED_LOG_FILE: string = path.join(path.dirname(CONFIG_FILE), "denied.log");
+
 export function defaultConfig(): ImeConfig {
   return { meHandles: [], allowFrom: [], pollingEnabled: false, pollIntervalMs: 1000 };
 }
